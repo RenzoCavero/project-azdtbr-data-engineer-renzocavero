@@ -16,9 +16,7 @@ jobs:
     - name: Install jq & curl
       run: sudo apt-get update && sudo apt-get install -y jq curl
 
-    # ----------------------------
-    # EXPORT NOTEBOOKS (DEV)
-    # ----------------------------
+    # Export notebooks desde DEV
     - name: Export notebooks from DEV
       run: |
         ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
@@ -26,6 +24,7 @@ jobs:
 
         PROC_BASE="/Workspace/Users/renzos.caveroc@gmail.com/project-azdtbr-data-engineer-renzocavero/proceso"
         PREP_BASE="/Workspace/Users/renzos.caveroc@gmail.com/project-azdtbr-data-engineer-renzocavero/prepamb"
+        SEC_BASE="/Workspace/Users/renzos.caveroc@gmail.com/project-azdtbr-data-engineer-renzocavero/seguridad"
 
         NOTEBOOKS_PROC=("extract_customer" "extract_sales" "transform_customer" "transform_sales" "load_customer" "load_sales")
 
@@ -37,6 +36,12 @@ jobs:
           "$ORIGIN_HOST/api/2.0/workspace/export?path=$PREP_BASE/prep_ambiente&format=SOURCE&direct_download=true" \
           --output "notebooks_to_deploy/prep_ambiente.py"
 
+        echo "Exportando grants..."
+        curl -s -X GET \
+          -H "Authorization: Bearer $ORIGIN_TOKEN" \
+          "$ORIGIN_HOST/api/2.0/workspace/export?path=$SEC_BASE/grants.sql.dbquery.ipynb&format=SOURCE&direct_download=true" \
+          --output "notebooks_to_deploy/grants.py"
+
         for nb in "${NOTEBOOKS_PROC[@]}"; do
           echo "Exportando $nb..."
           curl -s -X GET \
@@ -45,9 +50,7 @@ jobs:
             --output "notebooks_to_deploy/$nb.py"
         done
 
-    # ----------------------------
-    # IMPORT NOTEBOOKS (PROD)
-    # ----------------------------
+    # Importar notebooks en PROD
     - name: Import notebooks to PROD
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
@@ -74,9 +77,7 @@ jobs:
             "$DEST_HOST/api/2.0/workspace/import"
         done
 
-    # ----------------------------
-    # GET CLUSTER ID
-    # ----------------------------
+    # Obtener cluster renzocavero
     - name: Get PROD Cluster ID
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
@@ -96,9 +97,7 @@ jobs:
 
         echo "CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_ENV
 
-    # ----------------------------
-    # DELETE JOB IF EXISTS
-    # ----------------------------
+    # Eliminar job si ya existe
     - name: Delete existing Job
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
@@ -118,9 +117,7 @@ jobs:
             "$DEST_HOST/api/2.1/jobs/delete"
         fi
 
-    # ----------------------------
-    # CREATE JOB
-    # ----------------------------
+    # Crear job con schedule mensual
     - name: Create Job
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
@@ -130,6 +127,13 @@ jobs:
         {
           "name": "etl-renzo-project",
           "format": "MULTI_TASK",
+
+          "schedule": {
+            "quartz_cron_expression": "0 0 2 28 * ?",
+            "timezone_id": "America/Lima",
+            "pause_status": "UNPAUSED"
+          },
+
           "tasks": [
             {
               "task_key": "prep",
@@ -171,6 +175,12 @@ jobs:
               "notebook_task": { "notebook_path": "/py/load_sales" },
               "existing_cluster_id": "$CLUSTER_ID",
               "depends_on":[{"task_key":"transform_sales"}]
+            },
+            {
+              "task_key": "grants",
+              "notebook_task": { "notebook_path": "/py/grants" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"load_customer"},{"task_key":"load_sales"}]
             }
           ]
         }
@@ -181,9 +191,7 @@ jobs:
           -d @job.json \
           "$DEST_HOST/api/2.1/jobs/create"
 
-    # ----------------------------
-    # RUN JOB
-    # ----------------------------
+    # Ejecutar inmediatamente después del deploy
     - name: Run Job
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
