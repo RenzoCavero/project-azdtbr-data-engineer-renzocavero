@@ -1,4 +1,4 @@
-name: Dynamic Databricks Notebook Deploy
+name: Databricks CI/CD + Job Orchestration
 
 on:
   push:
@@ -16,45 +16,57 @@ jobs:
     - name: Install jq & curl
       run: sudo apt-get update && sudo apt-get install -y jq curl
 
-    - name: Export multiple notebooks (raw)
+    # ----------------------------
+    # EXPORT NOTEBOOKS (DEV)
+    # ----------------------------
+    - name: Export notebooks from DEV
       run: |
         ORIGIN_HOST=${{ secrets.DATABRICKS_ORIGIN_HOST }}
         ORIGIN_TOKEN=${{ secrets.DATABRICKS_ORIGIN_TOKEN }}
-        NOTEBOOK_BASE="/Workspace/Users/renzos.caveroc@gmail.com/project-azdtbr-data-engineer-renzocavero/proceso"
-        NOTEBOOKS=("extract_customer" "extract_sales" "transform_customer" "transform_sales" "load_customer" "load_sales")
+
+        PROC_BASE="/Workspace/Users/renzos.caveroc@gmail.com/project-azdtbr-data-engineer-renzocavero/proceso"
+        PREP_BASE="/Workspace/Users/renzos.caveroc@gmail.com/project-azdtbr-data-engineer-renzocavero/prepamb"
+
+        NOTEBOOKS_PROC=("extract_customer" "extract_sales" "transform_customer" "transform_sales" "load_customer" "load_sales")
 
         mkdir -p notebooks_to_deploy
 
-        for nb in "${NOTEBOOKS[@]}"; do
-          echo "Exportando $nb en modo raw..."
+        echo "Exportando prep_ambiente..."
+        curl -s -X GET \
+          -H "Authorization: Bearer $ORIGIN_TOKEN" \
+          "$ORIGIN_HOST/api/2.0/workspace/export?path=$PREP_BASE/prep_ambiente&format=SOURCE&direct_download=true" \
+          --output "notebooks_to_deploy/prep_ambiente.py"
+
+        for nb in "${NOTEBOOKS_PROC[@]}"; do
+          echo "Exportando $nb..."
           curl -s -X GET \
             -H "Authorization: Bearer $ORIGIN_TOKEN" \
-            "$ORIGIN_HOST/api/2.0/workspace/export?path=$NOTEBOOK_BASE/$nb&format=SOURCE&direct_download=true" \
+            "$ORIGIN_HOST/api/2.0/workspace/export?path=$PROC_BASE/$nb&format=SOURCE&direct_download=true" \
             --output "notebooks_to_deploy/$nb.py"
         done
 
-    - name: Deploy notebooks to Destination Workspace
+    # ----------------------------
+    # IMPORT NOTEBOOKS (PROD)
+    # ----------------------------
+    - name: Import notebooks to PROD
       run: |
         DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
         DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
         DEST_BASE="/py"
 
+        curl -s -X POST \
+          -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"path\":\"$DEST_BASE\"}" \
+          "$DEST_HOST/api/2.0/workspace/mkdirs"
+
         for file in notebooks_to_deploy/*.py; do
           name=$(basename "$file" .py)
-          dest_path="$DEST_BASE/$name"
-
-          echo "Creando carpeta $DEST_BASE si no existe..."
-          curl -s -X POST \
-            -H "Authorization: Bearer $DEST_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"path\":\"$DEST_BASE\"}" \
-            "$DEST_HOST/api/2.0/workspace/mkdirs"
-
-          echo "Importando $file → $dest_path"
+          echo "Importando $name..."
           curl -s -X POST \
             -H "Authorization: Bearer $DEST_TOKEN" \
             -H "Content-Type: multipart/form-data" \
-            -F "path=$dest_path" \
+            -F "path=$DEST_BASE/$name" \
             -F "format=SOURCE" \
             -F "language=PYTHON" \
             -F "overwrite=true" \
@@ -62,8 +74,129 @@ jobs:
             "$DEST_HOST/api/2.0/workspace/import"
         done
 
-    - name: Clean up
-      run: rm -rf notebooks_to_deploy
+    # ----------------------------
+    # GET CLUSTER ID
+    # ----------------------------
+    - name: Get PROD Cluster ID
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        CLUSTER_NAME="renzocavero"
 
-    - name: Done
-      run: echo "All notebooks deployed with raw content!"
+        clusters=$(curl -s -X GET -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.0/clusters/list")
+
+        CLUSTER_ID=$(echo "$clusters" | jq -r --arg name "$CLUSTER_NAME" \
+          '.clusters[] | select(.cluster_name==$name) | .cluster_id')
+
+        if [ -z "$CLUSTER_ID" ]; then
+          echo "Cluster renzocavero no encontrado"
+          exit 1
+        fi
+
+        echo "CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_ENV
+
+    # ----------------------------
+    # DELETE JOB IF EXISTS
+    # ----------------------------
+    - name: Delete existing Job
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+        JOB_NAME="etl-renzo-project"
+
+        jobs=$(curl -s -X GET -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.1/jobs/list")
+
+        JOB_ID=$(echo "$jobs" | jq -r --arg name "$JOB_NAME" \
+          '.jobs[]? | select(.settings.name==$name) | .job_id')
+
+        if [ -n "$JOB_ID" ]; then
+          curl -s -X POST -H "Authorization: Bearer $DEST_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\":$JOB_ID}" \
+            "$DEST_HOST/api/2.1/jobs/delete"
+        fi
+
+    # ----------------------------
+    # CREATE JOB
+    # ----------------------------
+    - name: Create Job
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+
+        cat > job.json << EOF
+        {
+          "name": "etl-renzo-project",
+          "format": "MULTI_TASK",
+          "tasks": [
+            {
+              "task_key": "prep",
+              "notebook_task": { "notebook_path": "/py/prep_ambiente" },
+              "existing_cluster_id": "$CLUSTER_ID"
+            },
+            {
+              "task_key": "extract_customer",
+              "notebook_task": { "notebook_path": "/py/extract_customer" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"prep"}]
+            },
+            {
+              "task_key": "extract_sales",
+              "notebook_task": { "notebook_path": "/py/extract_sales" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"prep"}]
+            },
+            {
+              "task_key": "transform_customer",
+              "notebook_task": { "notebook_path": "/py/transform_customer" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"extract_customer"}]
+            },
+            {
+              "task_key": "transform_sales",
+              "notebook_task": { "notebook_path": "/py/transform_sales" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"extract_sales"}]
+            },
+            {
+              "task_key": "load_customer",
+              "notebook_task": { "notebook_path": "/py/load_customer" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"transform_customer"}]
+            },
+            {
+              "task_key": "load_sales",
+              "notebook_task": { "notebook_path": "/py/load_sales" },
+              "existing_cluster_id": "$CLUSTER_ID",
+              "depends_on":[{"task_key":"transform_sales"}]
+            }
+          ]
+        }
+        EOF
+
+        curl -s -X POST -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d @job.json \
+          "$DEST_HOST/api/2.1/jobs/create"
+
+    # ----------------------------
+    # RUN JOB
+    # ----------------------------
+    - name: Run Job
+      run: |
+        DEST_HOST=${{ secrets.DATABRICKS_DEST_HOST }}
+        DEST_TOKEN=${{ secrets.DATABRICKS_DEST_TOKEN }}
+
+        job_id=$(curl -s -X GET -H "Authorization: Bearer $DEST_TOKEN" \
+          "$DEST_HOST/api/2.1/jobs/list" | \
+          jq -r '.jobs[] | select(.settings.name=="etl-renzo-project") | .job_id')
+
+        curl -s -X POST -H "Authorization: Bearer $DEST_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"job_id\":$job_id}" \
+          "$DEST_HOST/api/2.1/jobs/run-now"
+
+    - name: Clean up
+      run: rm -rf notebooks_to_deploy job.json
